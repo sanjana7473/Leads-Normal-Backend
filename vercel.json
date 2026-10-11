@@ -1,0 +1,15 @@
+{
+  "buildCommand": "npm run build",
+  "functions": {
+    "api/index.js": {
+      "runtime": "@vercel/node@5.9.5",
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.js"
+    }
+  ]
+}

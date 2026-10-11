@@ -127,6 +127,23 @@ const TABLE_DDL = [
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL
   )`,
+  // Promised follow-up calls ("call me after 30 minutes"). due_at is a UTC ISO
+  // string; the dashboard renders it in IST. No FK on lead_id on purpose: the
+  // one-time leads-table rebuild must not be able to cascade-delete these rows.
+  `CREATE TABLE IF NOT EXISTS callbacks (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER,
+    lead_id TEXT,
+    due_at TEXT NOT NULL,
+    reason TEXT,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending','calling','done','missed','cancelled')),
+    attempts INTEGER DEFAULT 0,
+    last_attempt_at TEXT,
+    source_call_id TEXT,
+    result_call_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_callbacks_due ON callbacks(status, due_at)`,
   `CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -315,6 +332,18 @@ const CALL_LOG_MIGRATIONS = [
   `ALTER TABLE call_logs ADD COLUMN plivo_api_id TEXT`,
 ];
 
+// Voice-agent additions: which direction a call went, the Plivo call UUID the
+// flow reports, and richer appointment details for the dashboard's site-visit view.
+const VOICE_AGENT_MIGRATIONS = [
+  `ALTER TABLE call_logs ADD COLUMN direction TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN plivo_call_uuid TEXT`,
+  `ALTER TABLE call_logs ADD COLUMN user_id INTEGER`,
+  `ALTER TABLE appointments ADD COLUMN project TEXT`,
+  `ALTER TABLE appointments ADD COLUMN location TEXT`,
+  `ALTER TABLE appointments ADD COLUMN notes TEXT`,
+  `ALTER TABLE appointments ADD COLUMN source TEXT`,
+];
+
 // Knowledge Base schema migration: old databases have tagline/description/contact_*
 // columns from the structured KB; new ones just have `content`. Add the content
 // column idempotently — ALTER TABLE fails once applied, so the error is swallowed.
@@ -352,7 +381,7 @@ async function initDb(c: Client) {
 
   // Column migrations run individually — ALTER TABLE cannot be batched with
   // a guaranteed outcome, and duplicate-column errors are expected once applied.
-  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS, ...KB_MIGRATIONS, ...LEAD_REQUIREMENT_MIGRATIONS]) {
+  for (const sql of [...EMAIL_MESSAGE_MIGRATIONS, ...WHATSAPP_MESSAGE_MIGRATIONS, ...ATTACHMENT_MIGRATIONS, ...USER_ACCESS_MIGRATIONS, ...TENANCY_MIGRATIONS, ...CALL_LOG_MIGRATIONS, ...KB_MIGRATIONS, ...LEAD_REQUIREMENT_MIGRATIONS, ...VOICE_AGENT_MIGRATIONS]) {
     try {
       await c.execute(sql);
     } catch {
