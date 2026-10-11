@@ -49,14 +49,20 @@ const WHEN_HELP: Record<WhenError, string> = {
 
 // ---- helpers --------------------------------------------------------------
 
+// Values the flow can send when the AI had nothing to report: blanks, unfilled
+// "{{placeholders}}", and the words an extractor uses for "no answer".
+const EMPTY_WORDS = /^(null|undefined|none|nil|n\/a|na|unknown|not (?:mentioned|provided|specified|stated|given|available|applicable|discussed)|no (?:answer|information|data)|-+)$/i;
+function isBlankValue(t: string): boolean {
+  return !t || /\{\{.*\}\}/.test(t) || EMPTY_WORDS.test(t);
+}
+
 // Tolerant string: the flow templates values into JSON, so a field the agent left
-// blank can arrive as "" or as an unfilled "{{placeholder}}" — treat both as absent
+// blank can arrive as "" or as an unfilled "{{placeholder}}" — treat those as absent
 // rather than saving template text as caller data.
 const looseString = z.preprocess((v) => {
   if (v == null) return undefined;
   const t = (typeof v === "string" ? v : String(v)).trim();
-  if (!t || /\{\{.*\}\}/.test(t) || /^(null|undefined|n\/a|none|unknown)$/i.test(t)) return undefined;
-  return t;
+  return isBlankValue(t) ? undefined : t;
 }, z.string().optional());
 
 const idSchema = z.object({
@@ -135,7 +141,8 @@ function mergeRequirement(list: { label: string; value: string }[], label: strin
 router.post("/lookup", async (c) => {
   const api = c.get("api");
   try {
-    const body = idSchema.extend({ name: looseString, include_knowledge: z.boolean().optional() }).parse(await c.req.json());
+    const body = idSchema.extend({ name: looseString, direction: looseString, include_knowledge: z.boolean().optional() }).parse(await c.req.json());
+    const outbound = body.direction?.toLowerCase() === "outbound";
     const phone = body.phone ?? "";
     if (digitsOf(phone).length < MIN_PHONE_DIGITS) {
       return c.json(fail("The caller's number is missing or hidden. Ask for their phone number and continue.", { found: false, created: false }));
@@ -167,14 +174,14 @@ router.post("/lookup", async (c) => {
       callLogId = crypto.randomUUID();
       await db.execute({
         sql: `INSERT INTO call_logs (id, lead_id, user_id, goal, status, provider, direction, plivo_call_uuid, from_number, started_at, created_at)
-              VALUES (?, ?, ?, 'Inbound call', 'in_progress', 'plivo', 'inbound', ?, ?, ?, ?)`,
-        args: [callLogId, leadId, api.userId, body.call_uuid, phone.trim(), nowIso, nowIso],
+              VALUES (?, ?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?)`,
+        args: [callLogId, leadId, api.userId, outbound ? "Outbound call" : "Inbound call", outbound ? "outbound" : "inbound", body.call_uuid, phone.trim(), nowIso, nowIso],
       });
     }
     await insertEvent(db, {
-      lead_id: leadId, channel: "call", type: "call", direction: "inbound", handled_by: "ai",
-      action: "inbound-call",
-      summary: existed ? "Inbound call — returning contact" : "Inbound call — new contact",
+      lead_id: leadId, channel: "call", type: "call", direction: outbound ? "outbound" : "inbound", handled_by: "ai",
+      action: outbound ? "outbound-call" : "inbound-call",
+      summary: outbound ? "Outbound AI call — answered" : existed ? "Inbound call — returning contact" : "Inbound call — new contact",
       metadata: { from: phone, identified: existed, call_uuid: body.call_uuid ?? null, call_log_id: callLogId },
     });
 
@@ -228,7 +235,7 @@ router.post("/lookup", async (c) => {
     }
 
     const brief =
-      buildAgentBrief(normalized as unknown as Parameters<typeof buildAgentBrief>[0], null, { inbound: true }) +
+      buildAgentBrief(normalized as unknown as Parameters<typeof buildAgentBrief>[0], null, { inbound: !outbound }) +
       `\n\n${lines.join("\n")}` +
       (kb ? `\n\nBusiness knowledge base (answer questions about the business from this — do not invent facts):\n${kb}` : "");
 
@@ -306,7 +313,7 @@ router.post("/save-details", async (c) => {
     let touchedReqs = false;
     if (d.requirement_label && d.requirement_value) { mergeRequirement(reqs, d.requirement_label, d.requirement_value); touchedReqs = true; saved.push(d.requirement_label); }
     for (const r of d.requirements ?? []) {
-      if (r.label.trim() && r.value.trim()) { mergeRequirement(reqs, r.label, r.value); touchedReqs = true; saved.push(r.label); }
+      if (r.label.trim() && !isBlankValue(r.value.trim())) { mergeRequirement(reqs, r.label, r.value); touchedReqs = true; saved.push(r.label); }
     }
     if (touchedReqs) { sets.push("requirements = ?"); vals.push(serializeRequirements(reqs)); }
 
@@ -493,32 +500,34 @@ router.post("/callback", async (c) => {
 // ---- POST /voice/status ---------------------------------------------------
 // Move the lead along the pipeline: qualified (wants to proceed), proposal,
 // closed, or lost (not interested / do not contact).
-const statusSchema = idSchema.extend({ status: z.enum(LEAD_STATUSES), reason: looseString });
+const statusSchema = idSchema.extend({ status: looseString, reason: looseString });
 
 router.post("/status", async (c) => {
   const api = c.get("api");
   try {
     const d = statusSchema.parse(await c.req.json());
+    const wanted = (d.status ?? "").toLowerCase() as (typeof LEAD_STATUSES)[number];
+    if (!LEAD_STATUSES.includes(wanted)) return c.json({ ok: true, changed: false, message: "No status change." });
     const db = await getDb();
     const lead = await resolveLead(db, api.userId, d);
     if (!lead) return c.json(noLead());
     const now = new Date();
-    const notes = d.reason ? appendNote(lead.notes, `Status → ${d.status}: ${d.reason}`, now) : (lead.notes as string | null);
+    const notes = d.reason ? appendNote(lead.notes, `Status → ${wanted}: ${d.reason}`, now) : (lead.notes as string | null);
     await db.execute({
       sql: "UPDATE leads SET status = ?, notes = ?, last_activity = ? WHERE id = ? AND user_id = ?",
-      args: [d.status, notes ?? null, now.toISOString(), String(lead.id), api.userId],
+      args: [wanted, notes ?? null, now.toISOString(), String(lead.id), api.userId],
     });
     // A lost / do-not-contact lead must never get an automatic callback.
-    if (d.status === "lost") {
+    if (wanted === "lost") {
       await db.execute({ sql: "UPDATE callbacks SET status = 'cancelled' WHERE lead_id = ? AND status = 'pending'", args: [String(lead.id)] });
     }
     await insertEvent(db, {
       lead_id: String(lead.id), channel: "call", type: "call", direction: "inbound", handled_by: "ai",
       action: "status-changed",
-      summary: `Lead marked ${d.status}${d.reason ? ` — ${d.reason}` : ""}`,
+      summary: `Lead marked ${wanted}${d.reason ? ` — ${d.reason}` : ""}`,
       metadata: { call_log_id: await callLogIdFor(db, d.call_uuid) },
     });
-    return c.json({ ok: true, status: d.status, message: `Lead marked as ${d.status}.` });
+    return c.json({ ok: true, changed: true, status: wanted, message: `Lead marked as ${wanted}.` });
   } catch (e) {
     return c.json(fail(`Could not update the status: ${(e as Error).message}`));
   }
