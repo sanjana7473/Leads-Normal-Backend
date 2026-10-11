@@ -364,7 +364,18 @@ const LEAD_REQUIREMENT_MIGRATIONS = [
 // INSERT OR IGNORE keeps the seed idempotent across restarts/cold starts.
 const DEMO_USER_HASH = "$2b$10$/ixfDGIckZ5KISPFS5y7puGhS4MGJkUJHkrdgDMG.si2aBQtWHy2u";
 
+// Bump whenever TABLE_DDL or any *_MIGRATIONS list changes. Once a database has
+// recorded this version, a cold start skips the ~40 schema statements below —
+// on serverless every cold start used to pay for them (several seconds).
+const SCHEMA_VERSION = "2026-10-11-voice-agent-1";
+
 async function initDb(c: Client) {
+  await c.execute(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)`);
+  const recorded = (await c.execute({ sql: "SELECT value FROM app_meta WHERE key = 'schema_version'", args: [] })).rows[0] as
+    | { value?: string }
+    | undefined;
+  if (recorded?.value === SCHEMA_VERSION) return;
+
   // Single round-trip: all DDL + demo-user seed run atomically on cold start.
   // Explicit id=1 for the demo user avoids AUTOINCREMENT sequence drift from
   // repeated INSERT OR IGNORE on every cold start.
@@ -440,6 +451,11 @@ async function initDb(c: Client) {
   } catch {
     // FTS5 unavailable on this database — LIKE fallback handles retrieval.
   }
+
+  await c.execute({
+    sql: "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', ?)",
+    args: [SCHEMA_VERSION],
+  });
 }
 
 /**

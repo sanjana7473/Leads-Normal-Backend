@@ -82,10 +82,13 @@ function nameKnown(lead: Row): boolean {
 }
 
 async function findByPhone(db: Client, userId: number, phone: string): Promise<Row | undefined> {
+  const tail = digitsOf(phone).slice(-7);
   const rows = (
     await db.execute({
-      sql: "SELECT * FROM leads WHERE user_id = ? AND phone IS NOT NULL AND phone != '' ORDER BY COALESCE(last_activity, created_at) DESC",
-      args: [userId],
+      sql: `SELECT * FROM leads WHERE user_id = ? AND phone IS NOT NULL AND phone != ''
+            AND replace(replace(replace(replace(replace(phone,' ',''),'-',''),'+',''),'(',''),')','') LIKE ?
+            ORDER BY COALESCE(last_activity, created_at) DESC`,
+      args: [userId, `%${tail}`],
     })
   ).rows as unknown as Row[];
   return rows.find((r) => phoneMatches(String(r.phone), phone));
@@ -178,44 +181,51 @@ router.post("/lookup", async (c) => {
         args: [callLogId, leadId, api.userId, outbound ? "Outbound call" : "Inbound call", outbound ? "outbound" : "inbound", body.call_uuid, phone.trim(), nowIso, nowIso],
       });
     }
-    await insertEvent(db, {
-      lead_id: leadId, channel: "call", type: "call", direction: outbound ? "outbound" : "inbound", handled_by: "ai",
-      action: outbound ? "outbound-call" : "inbound-call",
-      summary: outbound ? "Outbound AI call — answered" : existed ? "Inbound call — returning contact" : "Inbound call — new contact",
-      metadata: { from: phone, identified: existed, call_uuid: body.call_uuid ?? null, call_log_id: callLogId },
-    });
-
-    // History the agent can refer to: last conversation, upcoming visits, pending callbacks.
-    const lastCall = (
+    // Plivo retries a slow request, so don't log the same call twice within a minute.
+    const recent = (
       await db.execute({
+        sql: "SELECT 1 FROM events WHERE lead_id = ? AND action = ? AND created_at > ? LIMIT 1",
+        args: [leadId, outbound ? "outbound-call" : "inbound-call", new Date(now.getTime() - 60000).toISOString()],
+      })
+    ).rows.length > 0;
+    const logEvent = recent
+      ? Promise.resolve()
+      : insertEvent(db, {
+          lead_id: leadId, channel: "call", type: "call", direction: outbound ? "outbound" : "inbound", handled_by: "ai",
+          action: outbound ? "outbound-call" : "inbound-call",
+          summary: outbound ? "Outbound AI call — answered" : existed ? "Inbound call — returning contact" : "Inbound call — new contact",
+          metadata: { from: phone, identified: existed, call_uuid: body.call_uuid ?? null, call_log_id: callLogId },
+        });
+
+    // History the agent can refer to + the knowledge base: independent reads, run together.
+    const [lastCallRes, visitsRes, callbacksRes, kb] = await Promise.all([
+      db.execute({
         sql: `SELECT summary, outcome, created_at FROM call_logs
               WHERE lead_id = ? AND summary IS NOT NULL AND summary != '' AND (id != ? OR ? IS NULL)
               ORDER BY created_at DESC LIMIT 1`,
         args: [leadId, callLogId, callLogId],
-      })
-    ).rows[0] as unknown as { summary: string; outcome: string | null; created_at: string } | undefined;
-    const visits = (
-      await db.execute({
+      }),
+      db.execute({
         sql: `SELECT id, title, project, location, scheduled_at FROM appointments
               WHERE lead_id = ? AND status = 'confirmed' AND scheduled_at >= ? ORDER BY scheduled_at ASC LIMIT 3`,
         args: [leadId, nowIso],
-      })
-    ).rows as unknown as { title: string; project: string | null; location: string | null; scheduled_at: string }[];
-    const callbacks = (
-      await db.execute({
+      }),
+      db.execute({
         sql: `SELECT id, due_at, reason FROM callbacks WHERE lead_id = ? AND status = 'pending' ORDER BY due_at ASC LIMIT 3`,
         args: [leadId],
-      })
-    ).rows as unknown as { due_at: string; reason: string | null }[];
+      }),
+      body.include_knowledge === false
+        ? Promise.resolve("")
+        : getKnowledgeContext(db, api.userId, [String(lead.interest ?? ""), String(lead.category ?? "")].filter(Boolean).join(" ")),
+      logEvent,
+    ]);
+    const lastCall = lastCallRes.rows[0] as unknown as { summary: string; outcome: string | null; created_at: string } | undefined;
+    const visits = visitsRes.rows as unknown as { title: string; project: string | null; location: string | null; scheduled_at: string }[];
+    const callbacks = callbacksRes.rows as unknown as { due_at: string; reason: string | null }[];
 
     const normalized = normalizeLeadRequirements(lead) as Row & { requirements: { label: string; value: string }[] };
     const known = nameKnown(lead);
     const interest = [lead.interest, formatRequirements(normalized.requirements)].filter(Boolean).join(" — ");
-
-    const kb =
-      body.include_knowledge === false
-        ? ""
-        : await getKnowledgeContext(db, api.userId, [String(lead.interest ?? ""), String(lead.category ?? "")].filter(Boolean).join(" "));
 
     const lines: string[] = [
       `Current date and time: ${formatIst(now)}.`,
