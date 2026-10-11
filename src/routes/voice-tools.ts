@@ -49,7 +49,15 @@ const WHEN_HELP: Record<WhenError, string> = {
 
 // ---- helpers --------------------------------------------------------------
 
-const looseString = z.preprocess((v) => (v == null ? undefined : typeof v === "string" ? v.trim() : String(v)), z.string().optional());
+// Tolerant string: the flow templates values into JSON, so a field the agent left
+// blank can arrive as "" or as an unfilled "{{placeholder}}" — treat both as absent
+// rather than saving template text as caller data.
+const looseString = z.preprocess((v) => {
+  if (v == null) return undefined;
+  const t = (typeof v === "string" ? v : String(v)).trim();
+  if (!t || /\{\{.*\}\}/.test(t) || /^(null|undefined|n\/a|none|unknown)$/i.test(t)) return undefined;
+  return t;
+}, z.string().optional());
 
 const idSchema = z.object({
   phone: looseString,
