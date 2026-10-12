@@ -111,12 +111,24 @@ async function resolveLead(db: Client, userId: number, ids: { phone?: string; le
 const noLead = () =>
   fail("I couldn't find which caller this is. Call the lookup step first, or continue the conversation without saving.");
 
-async function callLogIdFor(db: Client, callUuid: string | undefined): Promise<string | null> {
-  if (!callUuid) return null;
-  const r = (await db.execute({ sql: "SELECT id FROM call_logs WHERE plivo_call_uuid = ? LIMIT 1", args: [callUuid] })).rows[0] as unknown as
-    | { id: string }
-    | undefined;
-  return r?.id ?? null;
+async function callLogIdFor(db: Client, callUuid: string | undefined, leadId?: string): Promise<string | null> {
+  if (callUuid) {
+    const r = (await db.execute({ sql: "SELECT id FROM call_logs WHERE plivo_call_uuid = ? LIMIT 1", args: [callUuid] })).rows[0] as unknown as
+      | { id: string }
+      | undefined;
+    if (r) return r.id;
+  }
+  // Outbound flows have no call UUID: the call in progress for this lead is the one.
+  if (leadId) {
+    const r = (
+      await db.execute({
+        sql: "SELECT id FROM call_logs WHERE lead_id = ? AND provider = 'plivo' AND status = 'in_progress' AND created_at > ? ORDER BY created_at DESC LIMIT 1",
+        args: [leadId, new Date(Date.now() - 45 * 60000).toISOString()],
+      })
+    ).rows[0] as unknown as { id: string } | undefined;
+    return r?.id ?? null;
+  }
+  return null;
 }
 
 const firstName = (name: string) => name.trim().split(/\s+/)[0] ?? name;
@@ -171,14 +183,27 @@ router.post("/lookup", async (c) => {
     }
     const leadId = String(lead.id);
 
-    // Log this call (once per Plivo call UUID) so transcripts attach to it later.
+    // One call log per call. Inbound calls carry the Plivo call UUID; outbound flows
+    // don't, so a lookup for the same lead and direction within 3 minutes is the same call.
+    const direction = outbound ? "outbound" : "inbound";
     let callLogId = await callLogIdFor(db, body.call_uuid);
-    if (!callLogId && body.call_uuid) {
+    if (!callLogId) {
+      const reuse = (
+        await db.execute({
+          sql: `SELECT id FROM call_logs WHERE lead_id = ? AND direction = ? AND status = 'in_progress' AND provider = 'plivo'
+                AND created_at > ? ORDER BY created_at DESC LIMIT 1`,
+          args: [leadId, direction, new Date(now.getTime() - 3 * 60000).toISOString()],
+        })
+      ).rows[0] as unknown as { id: string } | undefined;
+      callLogId = reuse?.id ?? null;
+    }
+    if (!callLogId) {
       callLogId = crypto.randomUUID();
       await db.execute({
-        sql: `INSERT INTO call_logs (id, lead_id, user_id, goal, status, provider, direction, plivo_call_uuid, from_number, started_at, created_at)
-              VALUES (?, ?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?)`,
-        args: [callLogId, leadId, api.userId, outbound ? "Outbound call" : "Inbound call", outbound ? "outbound" : "inbound", body.call_uuid, phone.trim(), nowIso, nowIso],
+        sql: `INSERT INTO call_logs (id, lead_id, user_id, goal, status, provider, direction, plivo_call_uuid, from_number, to_number, started_at, created_at)
+              VALUES (?, ?, ?, ?, 'in_progress', 'plivo', ?, ?, ?, ?, ?, ?)`,
+        args: [callLogId, leadId, api.userId, outbound ? "AI outbound call" : "AI inbound call", direction, body.call_uuid ?? null,
+               outbound ? process.env.PLIVO_NUMBER ?? null : phone.trim(), outbound ? phone.trim() : process.env.PLIVO_NUMBER ?? null, nowIso, nowIso],
       });
     }
     // Plivo retries a slow request, so don't log the same call twice within a minute.
@@ -344,7 +369,7 @@ router.post("/save-details", async (c) => {
     await insertEvent(db, {
       lead_id: String(lead.id), channel: "call", type: "call", direction: "inbound", handled_by: "ai",
       action: "details-saved", summary: `Caller details saved: ${[...new Set(saved)].join(", ")}`,
-      metadata: { call_log_id: await callLogIdFor(db, d.call_uuid) },
+      metadata: { call_log_id: await callLogIdFor(db, d.call_uuid, String(lead.id)) },
     });
 
     const fresh = (await db.execute({ sql: "SELECT * FROM leads WHERE id = ?", args: [String(lead.id)] })).rows[0] as unknown as Row;
@@ -390,7 +415,7 @@ router.post("/site-visit", async (c) => {
       })
     ).rows[0] as unknown as { id: string } | undefined;
 
-    const callLogId = await callLogIdFor(db, d.call_uuid);
+    const callLogId = await callLogIdFor(db, d.call_uuid, String(lead.id));
     let appointmentId: string;
     if (dup) {
       appointmentId = dup.id;
@@ -457,7 +482,7 @@ router.post("/callback", async (c) => {
     }
 
     const leadId = String(lead.id);
-    const callLogId = await callLogIdFor(db, d.call_uuid);
+    const callLogId = await callLogIdFor(db, d.call_uuid, String(lead.id));
 
     // An existing pending callback within 10 minutes of this one is the same promise — move it.
     const dup = (
@@ -535,11 +560,48 @@ router.post("/status", async (c) => {
       lead_id: String(lead.id), channel: "call", type: "call", direction: "inbound", handled_by: "ai",
       action: "status-changed",
       summary: `Lead marked ${wanted}${d.reason ? ` — ${d.reason}` : ""}`,
-      metadata: { call_log_id: await callLogIdFor(db, d.call_uuid) },
+      metadata: { call_log_id: await callLogIdFor(db, d.call_uuid, String(lead.id)) },
     });
     return c.json({ ok: true, changed: true, status: wanted, message: `Lead marked as ${wanted}.` });
   } catch (e) {
     return c.json(fail(`Could not update the status: ${(e as Error).message}`));
+  }
+});
+
+// ---- POST /voice/call-log -------------------------------------------------
+// Final step of a call: close the call log with the summary and outcome.
+const callLogSchema = idSchema.extend({
+  call_log_id: looseString, summary: looseString, outcome: looseString, status: looseString,
+});
+
+router.post("/call-log", async (c) => {
+  const api = c.get("api");
+  try {
+    const d = callLogSchema.parse(await c.req.json());
+    const db = await getDb();
+    const lead = await resolveLead(db, api.userId, d);
+    if (!lead) return c.json(noLead());
+    const row = (
+      d.call_log_id
+        ? await db.execute({ sql: "SELECT id, started_at FROM call_logs WHERE id = ? AND lead_id = ?", args: [d.call_log_id, String(lead.id)] })
+        : await db.execute({ sql: "SELECT id, started_at FROM call_logs WHERE lead_id = ? AND status = 'in_progress' AND provider = 'plivo' ORDER BY created_at DESC LIMIT 1", args: [String(lead.id)] })
+    ).rows[0] as unknown as { id: string; started_at: string | null } | undefined;
+    if (!row) return c.json({ ok: true, changed: false, message: "No open call to close." });
+
+    const end = new Date();
+    const dur = row.started_at ? Math.max(0, Math.round((end.getTime() - new Date(row.started_at).getTime()) / 1000)) : 0;
+    await db.execute({
+      sql: "UPDATE call_logs SET status = 'completed', outcome = COALESCE(?, outcome), summary = COALESCE(?, summary), ended_at = ?, duration_sec = ? WHERE id = ?",
+      args: [d.outcome ?? null, d.summary ?? null, end.toISOString(), dur, row.id],
+    });
+    await insertEvent(db, {
+      lead_id: String(lead.id), channel: "call", type: "call", direction: "internal", handled_by: "ai",
+      action: "call-completed", summary: d.summary ? `Call summary: ${d.summary}` : "AI call completed",
+      metadata: { call_log_id: row.id },
+    });
+    return c.json({ ok: true, changed: true, call_log_id: row.id });
+  } catch (e) {
+    return c.json(fail(`Could not close the call: ${(e as Error).message}`));
   }
 });
 

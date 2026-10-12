@@ -14,6 +14,7 @@ import publicRoutes from "./routes/public";
 import apiKeysRoutes from "./routes/api-keys";
 import externalRoutes from "./routes/external";
 import voiceToolRoutes from "./routes/voice-tools";
+import voiceDashboardRoutes from "./routes/voice-dashboard";
 
 const extraOrigins = (process.env.CORS_ORIGINS ?? "")
   .split(",")
@@ -43,6 +44,7 @@ app.route("/api/admin", adminRoutes);
 app.route("/api/knowledge", knowledgeRoutes); // authed — owner's own KB
 app.route("/api/public", publicRoutes); // public — published KB, read-only
 app.route("/api/keys", apiKeysRoutes); // dashboard — manage API keys (session auth)
+app.route("/api/voice", voiceDashboardRoutes); // dashboard: callbacks, site visits, call transcripts — session auth
 app.route("/api/v1/voice", voiceToolRoutes); // Agentflow voice-agent tools — API-key auth
 app.route("/api/v1", externalRoutes); // external REST API — API-key auth (see API.md)
 
